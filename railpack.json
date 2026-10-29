@@ -11,6 +11,7 @@
       "TZ": "UTC",
       "GOGC": "100",
       "GODEBUG": "madvdontneed=1",
+      "BERMUDA_REGION": "eu-central",
       "BERMUDA_PATH_XH": "/api/v1/sync",
       "BERMUDA_PATH_WS": "/api/v1/live",
       "BERMUDA_PATH_TR": "/api/v1/gateway",
