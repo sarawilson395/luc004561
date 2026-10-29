@@ -34,6 +34,7 @@ const (
 	defaultPathTR = "/api/v1/gateway"
 
 	defaultHealthPath = "/.well-known/hc-5b1e7c"
+	altHealthPath     = "/healthz"
 	portalSessionName = "__bp_sess"
 
 	openrestyServerToken = "openresty"
@@ -44,20 +45,20 @@ const (
 	openresty50xLastModified = openrestyIndexLastModified
 	openresty50xETag         = "\"610daa72-3d6\""
 
-	defaultProxyBufferSize  = 64 * 1024
-	defaultTransportBufSize = 64 * 1024
-	bufferPoolCapacity      = 64
-	halfCloseGrace          = 25 * time.Second
-	backendDialTimeout      = 5 * time.Second
-	backendHandshakeTimeout = 5 * time.Second
-	tunnelDrainPollInterval = 50 * time.Millisecond
+	defaultProxyBufferSize    = 64 * 1024
+	defaultTransportBufSize   = 64 * 1024
+	bufferPoolCapacity        = 64
+	halfCloseGrace            = 25 * time.Second
+	backendDialTimeout        = 5 * time.Second
+	backendHandshakeTimeout   = 5 * time.Second
+	tunnelDrainPollInterval   = 50 * time.Millisecond
 
-	xPaddingMinBytes     = 100
-	xPaddingMaxBytes     = 1000
-	xPaddingObfsMaxBytes = 500
-	xPaddingDefaultBytes = 256
-	internalObfsHeader   = "X-Bermuda-Obfs"
-	base62Chars          = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+	xPaddingMinBytes        = 100
+	xPaddingMaxBytes        = 1000
+	xPaddingObfsMaxBytes    = 500
+	xPaddingDefaultBytes    = 256
+	internalTransformHeader = "X-Bermuda-Mode"
+	base62Chars             = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
 )
 
 var (
@@ -202,22 +203,6 @@ const portalPanelTemplate = `<!DOCTYPE html>
 </body>
 </html>`
 
-type BermudaPortalBundle struct {
-	Version          int               `json:"v"`
-	LucityDomain     string            `json:"lucity_domain"`
-	CloudflareDomain string            `json:"cloudflare_domain,omitempty"`
-	ActiveDomain     string            `json:"active_domain"`
-	Region           string            `json:"region"`
-	MasterKey        string            `json:"master_key"`
-	UUIDv4           string            `json:"uuid_v4"`
-	UUIDv6           string            `json:"uuid_v6"`
-	TrojanV4         string            `json:"trojan_v4"`
-	TrojanV6         string            `json:"trojan_v6"`
-	Paths            map[string]string `json:"paths"`
-	Ports            []string          `json:"ports"`
-	CreatedAt        int64             `json:"created_at"`
-}
-
 type recycledBufferPool struct {
 	size int
 	ch   chan []byte
@@ -303,12 +288,20 @@ func NewGateway(sup *Supervisor, cf *CloudflareClient, lucityDomain, cloudflareD
 
 func newGateway(sup *Supervisor, cf *CloudflareClient, lucityDomain, cloudflareDomain, region string, proxyBuf, transportBuf int) *Gateway {
 	cleanLC := cleanHost(lucityDomain)
+	if !isLucityPublicDomain(cleanLC) {
+		cleanLC = ""
+	}
 	cleanCF := cleanHost(cloudflareDomain)
+	if isLucityManagedDomain(cleanCF) {
+		cleanCF = ""
+	}
 	if cf != nil {
 		if cleanCF == "" {
-			cleanCF = cleanHost(cf.CachedZoneDomain())
+			if cached := cleanHost(cf.CachedZoneDomain()); cached != "" && !isLucityManagedDomain(cached) {
+				cleanCF = cached
+			}
 		}
-		if discoveredLC := cleanHost(cf.GetLucityOrigin()); discoveredLC != "" {
+		if discoveredLC := cleanHost(cf.GetLucityOrigin()); isLucityPublicDomain(discoveredLC) {
 			if cleanLC == "" || (!isFullLucityServiceDomain(cleanLC) && isFullLucityServiceDomain(discoveredLC)) {
 				cleanLC = discoveredLC
 			}
@@ -401,6 +394,53 @@ func (g *Gateway) SetInfrastructureDomains(lucityDom, cfDom, reg string) {
 	g.domainMu.Unlock()
 }
 
+// observeRequestHost passively learns the Lucity platform domain (e.g. "luc00001241-development-9271x.lucity.app")
+// or custom domain (e.g. "portal.example.dpdns.org") from incoming request Host headers in nanoseconds.
+func (g *Gateway) observeRequestHost(reqHost string) {
+	if g == nil || reqHost == "" {
+		return
+	}
+	g.domainMu.RLock()
+	hasLC := isFullLucityServiceDomain(g.lucityDomain)
+	hasCF := g.cloudflareDomain != ""
+	lc := g.lc
+	cf := g.cf
+	g.domainMu.RUnlock()
+
+	if hasLC && hasCF {
+		return
+	}
+
+	clean := cleanHost(reqHost)
+	if isLocalLoopbackHost(clean) || isLucityCnameAlias(clean) {
+		return
+	}
+
+	if isLucityPublicDomain(clean) && !hasLC {
+		g.SetInfrastructureDomains(clean, "", "")
+		if g.sup != nil {
+			g.sup.SetInfrastructureDomains(clean, "", "")
+		}
+		if cf != nil {
+			cf.SetLucityOrigin(clean)
+		}
+		if lc != nil {
+			lc.SetServiceDomain(clean)
+		}
+	} else if !isLucityManagedDomain(clean) && !hasCF {
+		g.SetInfrastructureDomains("", clean, "")
+		if g.sup != nil {
+			g.sup.SetInfrastructureDomains("", clean, "")
+		}
+		if cf != nil {
+			cf.SetPreferredDomain(clean)
+		}
+		if lc != nil {
+			lc.SetCustomDomain(clean)
+		}
+	}
+}
+
 func extractClientIP(h http.Header) string {
 	if cfIP := strings.TrimSpace(h.Get("CF-Connecting-IP")); cfIP != "" {
 		return cfIP
@@ -424,8 +464,10 @@ func newLoopbackTransport(bufSize int) *http.Transport {
 		KeepAlive: -1,
 	}
 	return &http.Transport{
-		Proxy:                 nil,
-		DialContext:           dialer.DialContext,
+		Proxy: nil,
+		DialContext: func(ctx context.Context, _, addr string) (net.Conn, error) {
+			return dialer.DialContext(ctx, "tcp4", addr)
+		},
 		ForceAttemptHTTP2:     false,
 		MaxIdleConns:          128,
 		MaxIdleConnsPerHost:   64,
@@ -670,9 +712,9 @@ func newBackendProxy(targetAddr string, tr http.RoundTripper, bp httputil.Buffer
 				}
 				pr.Out.Header.Set("Referer", "https://"+host+reqPath+"?x_padding="+xPaddingRepeatX[:padLen])
 				pr.Out.Header.Del("X-Cache")
-				pr.Out.Header.Set(internalObfsHeader, "1")
+				pr.Out.Header.Set(internalTransformHeader, "1")
 			} else {
-				pr.Out.Header.Del(internalObfsHeader)
+				pr.Out.Header.Del(internalTransformHeader)
 			}
 		},
 		ModifyResponse: func(res *http.Response) error {
@@ -682,7 +724,7 @@ func newBackendProxy(targetAddr string, tr http.RoundTripper, bp httputil.Buffer
 			case http.StatusMethodNotAllowed:
 				rewriteTo405(res)
 			default:
-				if res.Request != nil && res.Request.Header.Get(internalObfsHeader) == "1" {
+				if res.Request != nil && res.Request.Header.Get(internalTransformHeader) == "1" {
 					rawPad := res.Header.Get("X-Padding")
 					res.Header.Del("X-Padding")
 					res.Header.Del("Access-Control-Allow-Origin")
@@ -709,7 +751,7 @@ func newBackendProxy(targetAddr string, tr http.RoundTripper, bp httputil.Buffer
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			if !errors.Is(err, context.Canceled) {
-				log.Printf("[Proxy] Error: backend %s unreachable: %v", targetAddr, err)
+				log.Printf("[Proxy] Error: upstream %s unreachable: %v", targetAddr, err)
 			}
 			if r.Method == http.MethodPost || r.Method == http.MethodPut {
 				camoOpenResty(w, r, http.StatusMethodNotAllowed, openresty405HTML, nil)
@@ -824,11 +866,12 @@ func matchBase(p, base string) bool {
 }
 
 func isLocalLoopbackHost(h string) bool {
-	return h == "" || h == "127.0.0.1" || h == "localhost" || h == "::1" ||
-		strings.HasSuffix(h, ".internal") || strings.HasSuffix(h, ".cluster.local") || strings.HasSuffix(h, ".svc")
+	return h == "" || h == "127.0.0.1" || h == "localhost" || h == "::1" || h == "0.0.0.0" ||
+		strings.HasSuffix(h, ".internal") || strings.HasSuffix(h, ".local") ||
+		strings.HasSuffix(h, ".cluster.local") || strings.HasSuffix(h, ".svc")
 }
 
-func (g *Gateway) generatePortalBundle(reqHost string) (string, BermudaPortalBundle, error) {
+func (g *Gateway) generatePortalBundle(reqHost string) (string, map[string]any, error) {
 	creds := g.sup.Credentials()
 	cleanReqHost := cleanHost(reqHost)
 
@@ -874,7 +917,7 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, BermudaPortalBun
 		}
 	}
 
-	if !isLocalLoopbackHost(cleanReqHost) {
+	if !isLocalLoopbackHost(cleanReqHost) && !isLucityCnameAlias(cleanReqHost) {
 		if isLucityPublicDomain(cleanReqHost) {
 			if g.lucityDomain == "" || (!isFullLucityServiceDomain(g.lucityDomain) && isFullLucityServiceDomain(cleanReqHost)) {
 				g.lucityDomain = cleanReqHost
@@ -898,6 +941,13 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, BermudaPortalBun
 		}
 	}
 
+	if !isLucityPublicDomain(g.lucityDomain) {
+		g.lucityDomain = ""
+	}
+	if isLucityManagedDomain(g.cloudflareDomain) {
+		g.cloudflareDomain = ""
+	}
+
 	lucityDom := g.lucityDomain
 	cfDomain := g.cloudflareDomain
 	reg := g.region
@@ -911,32 +961,20 @@ func (g *Gateway) generatePortalBundle(reqHost string) (string, BermudaPortalBun
 	if activeDom == "" {
 		activeDom = lucityDom
 	}
-	if activeDom == "" && !isLocalLoopbackHost(cleanReqHost) {
+	if activeDom == "" && !isLocalLoopbackHost(cleanReqHost) && !isLucityCnameAlias(cleanReqHost) {
 		activeDom = cleanReqHost
 	}
 
 	portsCopy := make([]string, len(defaultPortalPorts))
 	copy(portsCopy, defaultPortalPorts)
 
-	bundle := BermudaPortalBundle{
-		Version:          1,
-		LucityDomain:     lucityDom,
-		CloudflareDomain: cfDomain,
-		ActiveDomain:     activeDom,
-		Region:           reg,
-		MasterKey:        creds.MasterKey,
-		UUIDv4:           creds.UUIDv4,
-		UUIDv6:           creds.UUIDv6,
-		TrojanV4:         creds.TrojanV4,
-		TrojanV6:         creds.TrojanV6,
-		Paths: map[string]string{
-			"xh": g.pathXH,
-			"ws": g.pathWS,
-			"tr": g.pathTR,
-		},
-		Ports:     portsCopy,
-		CreatedAt: time.Now().Unix(),
+	pathsMap := map[string]string{
+		"xh": g.pathXH,
+		"ws": g.pathWS,
+		"tr": g.pathTR,
 	}
+
+	bundle := buildBundlePayloadMap(lucityDom, cfDomain, activeDom, reg, creds, pathsMap, portsCopy)
 
 	raw, err := json.Marshal(bundle)
 	if err != nil {
@@ -1039,6 +1077,7 @@ func (g *Gateway) servePortalPanel(w http.ResponseWriter, r *http.Request, setCo
 func (g *Gateway) Handler() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		g.totalReq.Add(1)
+		g.observeRequestHost(r.Host)
 
 		if r.URL.RawQuery != "" {
 			q := r.URL.Query()
@@ -1065,7 +1104,7 @@ func (g *Gateway) Handler() http.Handler {
 		}
 
 		switch {
-		case p == g.healthPath:
+		case p == g.healthPath || p == defaultHealthPath || p == altHealthPath:
 			g.handleHealth(w, r)
 		case matchBase(p, g.pathXH):
 			if g.draining.Load() {
@@ -1143,7 +1182,7 @@ func (g *Gateway) serveWS(w http.ResponseWriter, r *http.Request, backend string
 	}
 
 	ctx, cancel := context.WithTimeout(r.Context(), backendDialTimeout)
-	raw, err := g.dialer.DialContext(ctx, "tcp", backend)
+	raw, err := g.dialer.DialContext(ctx, "tcp4", backend)
 	cancel()
 	if err != nil {
 		camoOpenResty(w, r, http.StatusBadGateway, openresty50xHTML, nil)
@@ -1223,6 +1262,8 @@ func (g *Gateway) serveWS(w http.ResponseWriter, r *http.Request, backend string
 	deadline := time.Now().Add(backendHandshakeTimeout)
 	_ = ct.SetDeadline(deadline)
 	_ = bc.SetDeadline(deadline)
+
+	resp.Header.Set("X-Accel-Buffering", "no")
 
 	var head bytes.Buffer
 	head.WriteString("HTTP/1.1 101 Switching Protocols\r\n")
