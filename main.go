@@ -18,16 +18,17 @@ import (
 )
 
 const (
-	defaultPort            = "8080"
-	fallbackSelfMemMB      = 128
-	fallbackXrayMemMB      = 550
-	defaultGOMAXPROCS      = 2
-	gatewayMemPercent      = 12
-	xrayMemPercent         = 55
-	httpDrainTimeout       = 7 * time.Second
-	edgeKeepAlivePeriod    = 15 * time.Second
-	drainPropagationWindow = 400 * time.Millisecond
-	tcpUserTimeoutOpt      = 18
+	defaultPort               = "8080"
+	fallbackSelfMemMB         = 122
+	fallbackWorkerMemMB       = 563
+	defaultGOMAXPROCS         = 2
+	gatewayMemPercent         = 12
+	workerMemPercent          = 55
+	httpDrainTimeout          = 7 * time.Second
+	edgeKeepAlivePeriod       = 15 * time.Second
+	drainPropagationWindow    = 400 * time.Millisecond
+	startupOrchestrationDelay = 3 * time.Second
+	tcpUserTimeoutOpt         = 18
 )
 
 func cgroupMemoryLimit() (uint64, bool) {
@@ -53,33 +54,37 @@ func cgroupMemoryLimit() (uint64, bool) {
 	return 0, false
 }
 
-func deriveMemoryBudget() (gwMB, xrayMB int) {
-	gwMB, xrayMB = fallbackSelfMemMB, fallbackXrayMemMB
+func deriveMemoryBudget() (gwMB, workerMB int) {
+	// Calibrated for 1 GB (1024 MiB) RAM baseline while scaling dynamically via cgroup
+	gwMB, workerMB = fallbackSelfMemMB, fallbackWorkerMemMB
 	limit, limited := cgroupMemoryLimit()
 	if limited {
 		totalMB := int(limit >> 20)
 		gwMB = totalMB * gatewayMemPercent / 100
-		xrayMB = totalMB * xrayMemPercent / 100
+		workerMB = totalMB * workerMemPercent / 100
 
 		allowedMB := totalMB * 67 / 100
-		if gwMB < 32 {
-			gwMB = 32
+		if gwMB < 48 {
+			gwMB = 48
 		}
-		if xrayMB < 64 {
-			xrayMB = 64
+		if workerMB < 64 {
+			workerMB = 64
 		}
-		if total := gwMB + xrayMB; total > allowedMB && allowedMB >= 96 {
+		if total := gwMB + workerMB; total > allowedMB && allowedMB >= 112 {
 			gwMB = allowedMB * gatewayMemPercent / 67
-			xrayMB = allowedMB * xrayMemPercent / 67
+			workerMB = allowedMB * workerMemPercent / 67
 		}
 	}
 
 	gwMB = getEnvInt("BERMUDA_SELF_MEM_MB", gwMB)
-	xrayMB = getEnvInt("BERMUDA_XRAY_MEM_MB", xrayMB)
-	return gwMB, xrayMB
+	workerMB = getEnvInt("BERMUDA_WORKER_MEM_MB", getEnvInt("BERMUDA_XRAY_MEM_MB", workerMB))
+	return gwMB, workerMB
 }
 
 func applyMemoryCeiling(selfMB int) {
+	if selfMB < 48 {
+		selfMB = 48
+	}
 	debug.SetMemoryLimit(int64(selfMB) << 20)
 	debug.SetGCPercent(100)
 }
@@ -115,10 +120,10 @@ func applyGOMAXPROCS() int {
 			n = int(math.Ceil(q))
 		}
 	}
-	if n <= 0 {
+	if n < 2 {
 		n = defaultGOMAXPROCS
 	}
-	if cpus := runtime.NumCPU(); n > cpus {
+	if cpus := runtime.NumCPU(); n > cpus && cpus > 0 {
 		n = cpus
 	}
 	runtime.GOMAXPROCS(n)
@@ -132,6 +137,20 @@ func minTime(a, b time.Time) time.Time {
 	return b
 }
 
+func sleepContext(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
 func cleanHost(h string) string {
 	h = strings.TrimSpace(h)
 	if strings.HasPrefix(h, "${{") || strings.HasPrefix(h, "$") {
@@ -139,30 +158,77 @@ func cleanHost(h string) string {
 	}
 	h = strings.TrimPrefix(h, "https://")
 	h = strings.TrimPrefix(h, "http://")
-	h = strings.TrimRight(h, "/")
+	if slashIdx := strings.IndexByte(h, '/'); slashIdx != -1 {
+		h = h[:slashIdx]
+	}
+	h = strings.TrimRight(h, "/.")
 	if idx := strings.Index(h, ":"); idx != -1 && !strings.Contains(h, "]") {
 		h = h[:idx]
 	}
 	return strings.ToLower(strings.TrimSpace(h))
 }
 
-func isLucityManagedDomain(h string) bool {
+// isLucityCnameAlias distinguishes Lucity shared ingress load-balancer targets
+// (such as "lb.lucity.app" or "lb.lucity.cloud") from an application's own
+// platform domain (such as "luc00001241-development-9271x.lucity.app").
+func isLucityCnameAlias(h string) bool {
+	h = cleanHost(h)
 	if h == "" {
 		return false
 	}
-	return strings.Contains(h, "lucity.app") ||
+	if h == "lb.lucity.app" || h == "lb.lucity.cloud" ||
+		strings.HasSuffix(h, ".lb.lucity.app") || strings.HasSuffix(h, ".lb.lucity.cloud") {
+		return true
+	}
+	for _, suffix := range []string{".lucity.app", ".lucity.cloud"} {
+		if strings.HasSuffix(h, suffix) {
+			sub := strings.TrimSuffix(h, suffix)
+			if sub != "" && !strings.Contains(sub, ".") && !strings.Contains(sub, "-") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isLucityManagedDomain(h string) bool {
+	h = cleanHost(h)
+	if h == "" {
+		return false
+	}
+	return isLucityCnameAlias(h) ||
+		strings.Contains(h, "lucity.app") ||
 		strings.Contains(h, "lucity.cloud") ||
 		strings.HasSuffix(h, ".cluster.local") ||
 		strings.HasSuffix(h, ".svc") ||
-		strings.HasSuffix(h, ".internal")
+		strings.HasSuffix(h, ".internal") ||
+		strings.HasSuffix(h, ".local")
 }
 
 func isLucityPublicDomain(h string) bool {
-	return h != "" &&
-		(strings.Contains(h, "lucity.app") || strings.Contains(h, "lucity.cloud")) &&
+	h = cleanHost(h)
+	if h == "" || isLucityCnameAlias(h) {
+		return false
+	}
+	return (strings.Contains(h, "lucity.app") || strings.Contains(h, "lucity.cloud")) &&
 		!strings.HasSuffix(h, ".internal") &&
+		!strings.HasSuffix(h, ".local") &&
 		!strings.HasSuffix(h, ".cluster.local") &&
 		!strings.HasSuffix(h, ".svc")
+}
+
+func isFullLucityServiceDomain(h string) bool {
+	h = cleanHost(h)
+	if h == "" || isLucityCnameAlias(h) {
+		return false
+	}
+	for _, suffix := range []string{".lucity.app", ".lucity.cloud"} {
+		if strings.HasSuffix(h, suffix) {
+			sub := strings.TrimSuffix(h, suffix)
+			return sub != "" && strings.Contains(sub, "-")
+		}
+	}
+	return false
 }
 
 func normalizeRegion(raw string) string {
@@ -218,9 +284,29 @@ func orchestrateCloudInfrastructure(
 	initialCF string,
 	region string,
 ) {
+	for i := 0; i < 120 && !sup.IsReady(); i++ {
+		if !sleepContext(ctx, 250*time.Millisecond) {
+			return
+		}
+	}
+
+	if !sleepContext(ctx, startupOrchestrationDelay) {
+		return
+	}
+
 	lucityDomain := cleanHost(initialLC)
 	customDomain := cleanHost(initialCF)
+	if curLC, curCF, _ := sup.GetInfrastructureDomains(); lucityDomain == "" || customDomain == "" {
+		if lucityDomain == "" && isLucityPublicDomain(curLC) {
+			lucityDomain = curLC
+		}
+		if customDomain == "" && curCF != "" && !isLucityManagedDomain(curCF) {
+			customDomain = curCF
+		}
+	}
+
 	topologyUpdated := false
+	loggedAfterDiscovery := false
 
 	syncDomains := func(newLC, newCF string) {
 		cleanLC := cleanHost(newLC)
@@ -244,7 +330,7 @@ func orchestrateCloudInfrastructure(
 		sup.SetInfrastructureDomains(lucityDomain, customDomain, region)
 		gw.SetInfrastructureDomains(lucityDomain, customDomain, region)
 		if cf != nil {
-			if lucityDomain != "" {
+			if isLucityPublicDomain(lucityDomain) {
 				cf.SetLucityOrigin(lucityDomain)
 			}
 			if customDomain != "" {
@@ -252,7 +338,7 @@ func orchestrateCloudInfrastructure(
 			}
 		}
 		if lc != nil {
-			if lucityDomain != "" {
+			if isLucityPublicDomain(lucityDomain) {
 				lc.SetServiceDomain(lucityDomain)
 			}
 			if customDomain != "" {
@@ -262,20 +348,27 @@ func orchestrateCloudInfrastructure(
 	}
 
 	if lc != nil && lc.IsConfigured() {
-		if sup.IsMasterKeyAutoGenerated() || sanitizeMasterKey(getEnv("BERMUDA_MASTER_KEY", getEnv("MASTER_KEY", ""))) == "" {
-			lc.PersistMasterKey(ctx, sup.MasterKey())
-		}
-
-		if srvDom, err := lc.EnsureServiceDomain(ctx); err == nil && srvDom != "" {
+		if srvDom, err := lc.EnsureServiceDomain(ctx); err == nil && isLucityPublicDomain(srvDom) {
 			syncDomains(srvDom, "")
 		} else if err != nil {
 			log.Printf("[Lucity] Notice: Service domain check: %v", err)
+		}
+
+		if (sup.IsMasterKeyAutoGenerated() || sanitizeMasterKey(getEnv("BERMUDA_MASTER_KEY", getEnv("MASTER_KEY", ""))) == "") &&
+			!strings.EqualFold(getEnv("BERMUDA_PERSIST_KEY", "true"), "false") {
+			lc.PersistMasterKey(ctx, sup.MasterKey())
 		}
 	}
 
 	if cf != nil && cf.Token != "" {
 		probeCtx, probeCancel := context.WithTimeout(ctx, 12*time.Second)
 		if cfDom, err := cf.FetchZoneDomain(probeCtx); err == nil && cfDom != "" {
+			if customDomain == "" {
+				// Auto-prefix portal. if the discovered zone is an apex domain
+				if !strings.HasPrefix(cfDom, "portal.") {
+					cfDom = "portal." + cfDom
+				}
+			}
 			syncDomains(cf.GetLucityOrigin(), cfDom)
 		} else if err != nil {
 			log.Printf("[Cloudflare] Notice: Zone domain discovery: %v", err)
@@ -283,10 +376,16 @@ func orchestrateCloudInfrastructure(
 		probeCancel()
 	}
 
-	var customDomInfo *LucityCustomDomainInfo
-	var cnameRecordID string
+	if topologyUpdated && ctx.Err() == nil {
+		log.Printf("[Runtime] Synchronized Cloud Topology: LucityDomain=%q | CloudflareDomain=%q | Region=%q",
+			lucityDomain, customDomain, region)
+		sup.LogProvisioningLink("")
+		loggedAfterDiscovery = true
+	}
 
-	if customDomain != "" && (lc != nil || lucityDomain != "") {
+	var customDomInfo *LucityCustomDomainInfo
+
+	if customDomain != "" {
 		if lc != nil && lc.IsConfigured() {
 			info, err := lc.EnsureCustomDomain(ctx, customDomain)
 			if err != nil {
@@ -296,23 +395,26 @@ func orchestrateCloudInfrastructure(
 				syncDomains(lc.GetServiceDomain(), info.Domain)
 			}
 		}
-		if customDomInfo == nil && lucityDomain != "" {
+
+		if customDomInfo == nil {
 			certState := "PENDING_HTTP01"
-			if probeCustomDomainTLS(ctx, customDomain, lucityDomain) {
+			if probeCustomDomainTLS(ctx, customDomain, defaultLCCNAMETarget) {
 				certState = "VALID"
 			}
 			customDomInfo = &LucityCustomDomainInfo{
 				Domain:            customDomain,
-				CNAMETarget:       lucityDomain,
+				CNAMETarget:       defaultLCCNAMETarget,
+				VerificationHost:  deriveLucityVerifyHost(customDomain),
+				VerificationToken: sanitizeExplicitCredential(getEnv("LUCITY_VERIFY_TOKEN", "")),
 				CertificateStatus: certState,
 			}
+		} else if customDomInfo.VerificationToken == "" {
+			customDomInfo.VerificationToken = sanitizeExplicitCredential(getEnv("LUCITY_VERIFY_TOKEN", ""))
 		}
-		if customDomInfo != nil && cf != nil && cf.Token != "" {
-			recID, dnsErr := cf.ProvisionLucityDNS(ctx, customDomInfo)
-			if dnsErr != nil {
+
+		if cf != nil && cf.Token != "" {
+			if _, dnsErr := cf.ProvisionLucityDNS(ctx, customDomInfo); dnsErr != nil {
 				log.Printf("[Cloudflare] Warning: Automated Lucity DNS provisioning: %v", dnsErr)
-			} else {
-				cnameRecordID = recID
 			}
 		}
 	}
@@ -322,43 +424,35 @@ func orchestrateCloudInfrastructure(
 		syncDomains(cf.GetLucityOrigin(), cf.CachedZoneDomain())
 	}
 
-	if cf != nil && customDomInfo != nil && !customDomInfo.IsCertificateValid() && ctx.Err() == nil {
-		log.Printf("[Lucity] Waiting for Let's Encrypt HTTP-01 TLS validation on %s before enabling Cloudflare Orange Cloud...", customDomInfo.Domain)
-		if lc != nil && lc.IsConfigured() {
-			updatedInfo, valid := lc.WaitCustomDomainCertificate(ctx, customDomInfo.ID, customDomInfo.Domain, defaultLCCertPollWait)
-			if valid && updatedInfo != nil {
-				cf.PromoteCustomDomainToOrangeCloud(ctx, updatedInfo.Domain, updatedInfo.CNAMETarget, cnameRecordID)
-			} else if ctx.Err() == nil {
-				go watchAndPromoteCustomDomain(ctx, lc, cf, customDomInfo, cnameRecordID)
-			}
-		} else {
-			go watchAndPromoteCustomDomain(ctx, nil, cf, customDomInfo, cnameRecordID)
-		}
+	if customDomInfo != nil && !customDomInfo.IsCertificateValid() && ctx.Err() == nil {
+		log.Printf("[Lucity] Monitoring Let's Encrypt HTTP-01 TLS issuance for %s (DNS-Only Grey Cloud Active)...", customDomInfo.Domain)
+		go watchCustomDomainTLS(ctx, lc, cf, customDomInfo)
 	}
 
 	if lc != nil && lc.IsConfigured() && ctx.Err() == nil {
 		lc.TuneComputeAndNetwork(ctx)
 	}
 
-	if ctx.Err() == nil && (topologyUpdated || lc != nil || cf != nil) {
+	if ctx.Err() == nil && !loggedAfterDiscovery && (topologyUpdated || lc != nil || cf != nil) {
 		log.Printf("[Runtime] Synchronized Cloud Topology: LucityDomain=%q | CloudflareDomain=%q | Region=%q",
 			lucityDomain, customDomain, region)
 		sup.LogProvisioningLink("")
 	}
 }
 
-func watchAndPromoteCustomDomain(
+func watchCustomDomainTLS(
 	parent context.Context,
 	lc *LucityClient,
 	cf *CloudflareClient,
 	info *LucityCustomDomainInfo,
-	cnameRecordID string,
 ) {
-	ctx, cancel := context.WithTimeout(parent, 15*time.Minute)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Minute)
 	defer cancel()
 
-	ticker := time.NewTicker(12 * time.Second)
+	ticker := time.NewTicker(15 * time.Second)
 	defer ticker.Stop()
+
+	txtSynced := info.VerificationToken != ""
 
 	for {
 		select {
@@ -367,15 +461,21 @@ func watchAndPromoteCustomDomain(
 		case <-ticker.C:
 			if lc != nil && lc.IsConfigured() {
 				latest, err := lc.FetchCustomDomainStatus(ctx, info.ID, info.Domain)
-				if err == nil && latest != nil && latest.IsCertificateValid() {
-					log.Printf("[Lucity] ✓ Deferred HTTP-01 TLS validation completed for %s (%s)",
-						latest.Domain, latest.CertificateStatus)
-					cf.PromoteCustomDomainToOrangeCloud(ctx, latest.Domain, latest.CNAMETarget, cnameRecordID)
-					return
+				if err == nil && latest != nil {
+					if !txtSynced && latest.VerificationToken != "" && cf != nil && cf.Token != "" {
+						if _, dnsErr := cf.ProvisionLucityDNS(ctx, latest); dnsErr == nil {
+							txtSynced = true
+						}
+					}
+					if latest.IsCertificateValid() {
+						log.Printf("[Lucity] ✓ Let's Encrypt HTTP-01 TLS Certificate ACTIVE & VERIFIED for %s (DNS-Only Mode)",
+							latest.Domain)
+						return
+					}
 				}
 			} else if probeCustomDomainTLS(ctx, info.Domain, info.CNAMETarget) {
-				log.Printf("[Lucity] ✓ Direct TLS Handshake verified for %s on %s", info.Domain, info.CNAMETarget)
-				cf.PromoteCustomDomainToOrangeCloud(ctx, info.Domain, info.CNAMETarget, cnameRecordID)
+				log.Printf("[Lucity] ✓ Direct TLS Handshake ACTIVE & VERIFIED for %s on %s (DNS-Only Mode)",
+					info.Domain, info.CNAMETarget)
 				return
 			}
 		}
@@ -429,7 +529,7 @@ func teardown(
 	gw.CloseTunnels()
 	gw.CloseIdleBackendConns()
 
-	log.Println("[Gateway] Stage 5/5: Tearing down engine worker process group...")
+	log.Println("[Gateway] Stage 5/5: Tearing down worker process group...")
 	supCancel()
 	remainingSupTime := time.Until(hardDeadline)
 	if remainingSupTime <= 0 {
@@ -439,17 +539,19 @@ func teardown(
 }
 
 func main() {
+	log.SetOutput(os.Stdout)
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Println("[Gateway] Initializing BERMUDA PORTAL Gateway (Lucity + Cloudflare Edition)...")
+	log.Println("[Gateway] Initializing BERMUDA PORTAL Edge Router (Lucity + Cloudflare Edition)...")
 
-	gwMB, xrayMB := deriveMemoryBudget()
-	applyMemoryCeiling(gwMB)
+	gwMB, workerMB := deriveMemoryBudget()
 	procs := applyGOMAXPROCS()
 
-	_ = syscall.Setenv("BERMUDA_XRAY_MEM_MB", strconv.Itoa(xrayMB))
+	_ = syscall.Setenv("BERMUDA_WORKER_MEM_MB", strconv.Itoa(workerMB))
+	_ = syscall.Setenv("BERMUDA_XRAY_MEM_MB", strconv.Itoa(workerMB))
+	_ = syscall.Setenv("BERMUDA_WORKER_GOMAXPROCS", strconv.Itoa(procs))
 	_ = syscall.Setenv("BERMUDA_XRAY_GOMAXPROCS", strconv.Itoa(procs))
-	log.Printf("[Runtime] Dynamic memory ceiling: Gateway=%dMiB, Engine=%dMiB (GOGC=100) | GOMAXPROCS=%d",
-		gwMB, xrayMB, procs)
+	log.Printf("[Runtime] Dynamic memory ceiling: Gateway=%dMiB, Worker=%dMiB (GOGC=100) | GOMAXPROCS=%d",
+		gwMB, workerMB, procs)
 
 	sigCtx, stopSig := signal.NotifyContext(context.Background(), syscall.SIGTERM, syscall.SIGINT)
 	defer stopSig()
@@ -460,38 +562,37 @@ func main() {
 	rawRegion := getEnv("BERMUDA_REGION", getEnv("LUCITY_REGION", getEnv("REGION", "")))
 	region := normalizeRegion(rawRegion)
 
+	// NewSupervisor initializes credentials, in-memory config, and subreaper in <1ms without
+	// blocking on network I/O, allowing the HTTP listener on :8080 to bind immediately.
 	sup := NewSupervisor()
-	if err := sup.PreflightContext(sigCtx); err != nil {
-		log.Printf("[Gateway] Warning: Supervisor preflight issue: %v. Continuing to start...", err)
-	}
 
 	cfToken := sanitizeCloudflareToken(getEnv("CLOUDFLARE_API_TOKEN", getEnv("BERMUDA_CF_API_TOKEN", "")))
 	cfZoneID := sanitizeExplicitCredential(getEnv("CLOUDFLARE_ZONE_ID", getEnv("BERMUDA_CF_ZONE_ID", "")))
 	var cf *CloudflareClient
 	if cfToken != "" {
 		cf = NewCloudflareClient(cfToken, cfZoneID)
-		if lucityDomain != "" {
+		if isLucityPublicDomain(lucityDomain) {
 			cf.SetLucityOrigin(lucityDomain)
 		}
 		if customDomain != "" {
 			cf.SetPreferredDomain(customDomain)
 		}
 	} else {
-		log.Println("[Cloudflare] Notice: CLOUDFLARE_API_TOKEN unset. Edge auto-tuning bypassed.")
+		log.Println("[Cloudflare] Notice: CLOUDFLARE_API_TOKEN unset. Edge DNS sync bypassed.")
 	}
 
 	lcToken := sanitizeLucityToken(getEnv("LUCITY_API_TOKEN", getEnv("LUCITY_TOKEN", getEnv("BERMUDA_LUCITY_TOKEN", ""))))
 	var lc *LucityClient
 	if lcToken != "" {
 		lc = NewLucityClient(lcToken)
-		if lucityDomain != "" {
+		if isLucityPublicDomain(lucityDomain) {
 			lc.SetServiceDomain(lucityDomain)
 		}
 		if customDomain != "" {
 			lc.SetCustomDomain(customDomain)
 		}
 	} else {
-		log.Println("[Lucity] Notice: LUCITY_API_TOKEN unset. Lucity self-provisioning bypassed.")
+		log.Println("[Lucity] Notice: LUCITY_API_TOKEN unset. Lucity API self-provisioning bypassed.")
 	}
 
 	sup.SetInfrastructureDomains(lucityDomain, customDomain, region)
@@ -520,14 +621,8 @@ func main() {
 		lc.SetTopologyCallback(topologyUpdater)
 	}
 
-	supCtx, supCancel := context.WithCancel(context.Background())
-	supErrCh := make(chan error, 1)
-	go func() {
-		supErrCh <- sup.Run(supCtx)
-	}()
-
 	srv := &http.Server{
-		Addr:              ":" + port,
+		Addr:              "0.0.0.0:" + port,
 		Handler:           gw.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       0,
@@ -558,6 +653,7 @@ func main() {
 		},
 	}
 
+	// Bind HTTP listener FIRST before starting worker bootstrap so Lucity's TCP port check passes immediately
 	ln, err := lcConfig.Listen(context.Background(), "tcp", srv.Addr)
 	if err != nil {
 		log.Fatalf("[Gateway] Fatal: Cannot bind listener on %s: %v", srv.Addr, err)
@@ -569,6 +665,24 @@ func main() {
 		if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			serverErrCh <- err
 		}
+	}()
+
+	supCtx, supCancel := context.WithCancel(context.Background())
+	supErrCh := make(chan error, 1)
+	go func() {
+		supErrCh <- sup.Run(supCtx)
+	}()
+
+	// Apply tight gateway memory ceiling after initial worker bootstrap finishes
+	go func() {
+		select {
+		case <-sup.BootstrapDone():
+		case <-sigCtx.Done():
+			return
+		}
+		runtime.GC()
+		debug.FreeOSMemory()
+		applyMemoryCeiling(gwMB)
 	}()
 
 	cloudCtx, cloudCancel := context.WithCancel(sigCtx)
